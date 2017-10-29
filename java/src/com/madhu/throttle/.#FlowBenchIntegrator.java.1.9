@@ -1,0 +1,316 @@
+
+package com.madhu.throttle;
+
+import static java.lang.Math.*;
+
+public class FlowBenchIntegrator {
+	private static final double GAS_CONSTANT_SI = 8.314472;
+	private static final double MSL_PRESSURE_PA = 1.01325e5;
+	private static final double MSL_PRESSURE_PSI = 14.696;
+	/**
+	 * Throttle bore diameter in inches
+	 */
+	private double throttleBore;
+	/**
+	 * Throttle shaft diameter in inches
+	 */
+	private double throttleShaft;
+	/**
+	 * Close throttle angle in degrees
+	 */
+	private double closedAngle;
+	/**
+	 * Throttle flow area in square inches
+	 */
+	private double aflow;
+	/**
+	 * Throttle plate discharge coefficient
+	 */
+	private double cdt;
+	private double cylinderBore;
+	private double pistonStroke;
+	private double rpm;
+	private double ambientPressure;
+	private double clearanceVolume;
+	private double pistonArea;
+	private double compressionRatio;
+	/**
+	 * Crank shaft angular velocity in rad/sec
+	 */
+	private double omega;
+	private double[][] CDTFig3 = {
+		{ 0, 0.6 },
+		{ 2.47, 0.61 },
+		{ 4.95, 0.64 },
+		{ 7.42, 0.72 },
+		{ 9.89, 0.79 },
+		{ 12.36, 0.82 },
+		{ 14.84, 0.84 },
+		{ 17.31, 0.85 },
+		{ 19.78, 0.86 },
+		{ 22.25, 0.87 },
+		{ 29.92, 0.89 },
+		{ 39.81, 0.91 },
+		{ 49.7, 0.93 },
+		{ 59.84, 0.94 },
+		{ 69.73, 0.94 },
+		{ 79.74, 0.95 },
+		{ 89.88, 0.95 },
+	};
+	private double minPressure;
+	private double minPressureAngle;
+	private double[] manifoldPressure;
+	private double ambientTemperature;
+
+	public FlowBenchIntegrator(double throttleBore, double throttleShaft,
+			double closedAngle, double compressionRatio, double cylinderBore,
+			double pistonStroke, double ambientPressure, double ambientTemperature) {
+		this.throttleBore = throttleBore;
+		this.throttleShaft = throttleShaft;
+		// EQN 2.6, correction for throttle leakage area
+		this.closedAngle = closedAngle * 0.9 - 3.8;
+		this.compressionRatio = compressionRatio;
+		this.cylinderBore = cylinderBore;
+		this.pistonStroke = pistonStroke;
+		this.ambientPressure = ambientPressure;
+		this.ambientTemperature = ambientTemperature;
+		this.pistonArea = PI * cylinderBore*cylinderBore / 4.0;
+		double displacement = pistonArea * pistonStroke;
+		this.clearanceVolume = displacement / (compressionRatio - 1);
+	}
+
+	public void setRPM(double rpm) {
+		this.rpm = rpm;
+		this.omega = 2*PI*rpm/60.0;
+	}
+
+	/**
+	 * Computes throttle flow area and discharge coefficient for a given throttle angle.
+	 * Throttle angle does not include the closed plate angle, e.g. angle of 0 is closed.
+	 * 
+	 * @param angle - throttle open angle in degrees
+	 */
+	private void setThrottle(double angle) {
+		angle += closedAngle;
+		if (angle < closedAngle || angle > 90) {
+			throw new IllegalArgumentException("Throttle angle is out of range: " + angle);
+		}
+		double da = angle - closedAngle;
+		double[][] cdtTable = CDTFig3;
+		if (da > cdtTable[cdtTable.length-1][0]) {
+			cdt = cdtTable[cdtTable.length-1][1];
+		} else {
+			double[] cdPair0 = null;
+			double[] cdPair1 = null;
+			for (int i=0; i<cdtTable.length-1; i+=1) {
+				cdPair0 = cdtTable[i+0];
+				cdPair1 = cdtTable[i+1];
+				if (da >= cdPair0[0] && da <= cdPair1[0]) {
+					break;
+				}
+			}
+			// linear interpolation
+			double f = (da - cdPair0[0])/(cdPair1[0] - cdPair0[0]);
+			cdt = cdPair0[1] + f * (cdPair1[1] - cdPair0[1]);
+		}
+		// now compute aflow
+		double th = angle * PI / 180.0;
+		double th0 = closedAngle * PI / 180.0;
+		double D = throttleBore;
+		double d = throttleShaft;
+		double costh = cos(th);
+		double costh0 = cos(th0);
+		aflow = PI*D*D*(1 - (costh/costh0))/4.0 + d*sqrt(D*D*costh*costh - d*d*costh0*costh0)/(2*costh) +
+			D*D*costh*asin(d*costh0/(D*costh))/(2*costh0) - d*sqrt(D*D - d*d)/2.0 + D*D*asin(d/D)/2.0;
+	}
+	
+	/**
+	 * Harrington eq. 2.10
+	 * 
+	 * @param p manifold pressure in Pa
+	 * @return flow rate in mols/sec
+	 */
+	private double computeMassFlowRate(double p) {
+		double P;
+		double Po;
+		// Reverse pressures to avoid NaN during startup
+		if (p < ambientPressure) {
+			P = p * MSL_PRESSURE_PSI / MSL_PRESSURE_PA;
+			Po = ambientPressure * MSL_PRESSURE_PSI / MSL_PRESSURE_PA;
+		} else {
+			Po = p * MSL_PRESSURE_PSI / MSL_PRESSURE_PA;
+			P = ambientPressure * MSL_PRESSURE_PSI / MSL_PRESSURE_PA;
+		}
+		double K = 1.40;
+		double gc = 32.174;
+		double R = 1545.4;
+		double W = 28.97;
+		double To = 540;
+
+		double pr = Po / P;
+		double k1 = (K - 1) / K;
+		double k2 = (K + 1) / (2 * K);
+		double t1 = aflow * cdt * sqrt(K * gc * W / (R * To));
+		double t2 = Po * sqrt(2/(K-1)) * sqrt(pow(pr, k1) - 1);
+		double t3 = pow(pr, k2);
+		double mdotlbm = t1 * t2 / t3;
+		// The factor of 0.5 was introduced to be more consistent with real world data
+		return 0.5 * 453.592 * mdotlbm / 28.97;
+	}
+
+	/**
+	 * From D.J. Dunn Section 6.  VENTURI METERS AND NOZZLES
+	 * 
+	 * @param p2 - manifold pressure in Pa
+	 * @return flow rate in mols/s
+	 */
+	private double computeMassFlowRateSI(double p2) {
+		double p1 = ambientPressure;
+		if (p2 > p1) {
+			p1 = p2;
+			p2 = ambientPressure;
+		}
+		double pr = p2/p1;
+		double a2 = aflow * 6.452e-4;
+		double mair = 28.97e-3;
+		double gamma = 1.4;
+		double to = ambientTemperature;
+		double t1 = cdt * a2 * p1;
+		double t2 = 2*gamma*mair / ((gamma-1) * GAS_CONSTANT_SI * to);
+		double t3 = pow(pr, 2/gamma) - pow(pr, 1+1/gamma);
+		// The factor of 0.5 was introduced to be more consistent with real world data
+		return 0.5 * t1 * sqrt(t2*t3) / mair;
+	}
+
+	private double dPdt(double t, double pressure) {
+		double volume = clearanceVolume + pistonArea*pistonStroke*(1-cos(omega * t))/2.0;
+		double dvdt = pistonArea*pistonStroke*omega*sin(omega * t)/2.0;
+		double massFlowRate = computeMassFlowRateSI(pressure);
+
+		return (GAS_CONSTANT_SI * ambientTemperature * massFlowRate - pressure * dvdt) / volume;
+	}
+
+	public double[] eulerMethod(double tmax, int n, double p) {
+		double dt = tmax / n;
+		double[] data = new double[n];
+		int i = 0;
+		for (double t = 0; t<tmax; t += dt) {
+			if (i < n) {
+				data[i++] = p;
+			}
+			p += dt * dPdt(t, p);
+		}
+		return data;
+	}
+
+	public double[] rk4(double tmax, int n, double p) {
+		double dt = tmax / n;
+		double dt2 = 0.5 * dt;
+		double[] data = new double[n];
+		double t = 0;
+		for (int i=0; i<n; i += 1) {
+			data[i] = p;
+			double k1 = dt * dPdt(t, p);
+			double k2 = dt * dPdt(t + dt2, p + 0.5*k1);
+			double k3 = dt * dPdt(t + dt2, p + 0.5*k2);
+			double k4 = dt * dPdt(t + dt, p + k3);
+			p += (k1 + 2*k2 + 2*k3 + k4) / 6.0;
+			t += dt;
+		}
+		return data;
+	}
+	
+	public void computeIntakeStroke(double po) {
+		double tmax = 30.0/rpm;
+		int n = 1000;
+		manifoldPressure = rk4(tmax, n, po);
+		minPressure = po;
+		minPressureAngle = 0.0;
+		for (int i = 0; i < manifoldPressure.length; i+=1) {
+			if (manifoldPressure[i] > 0.0 && manifoldPressure[i] < minPressure) {
+				minPressure = manifoldPressure[i];
+				minPressureAngle = i*180.0/n;
+			}
+		}
+	}
+
+	public double getMinPressure() {
+		return minPressure;
+	}
+
+	public double getMinPressureAngle() {
+		return minPressureAngle;
+	}
+	
+	public double[] getManifoldPressure() {
+		return manifoldPressure;
+	}
+	
+	public double getAirAmount() {
+		double pf = manifoldPressure[manifoldPressure.length - 1];
+		double vf = clearanceVolume + pistonArea*pistonStroke;
+		return pf * vf / (GAS_CONSTANT_SI * ambientTemperature);
+	}
+
+	private static void computeFuelTable() {
+		double po = MSL_PRESSURE_PA;
+		double tpsMin = 34;
+		double tpsMax = 197;
+		double[] rpmBins = { 1400, 1900, 3100, 4300, 5500, 6600, 7800, 9000 };
+		double[] tpsBins = { 34, 55, 80, 105, 130, 155, 180, 197 };
+
+		FlowBenchIntegrator fb = new FlowBenchIntegrator(1.575, 0.19, 8.43, 9.5, 0.079, 0.0712, po, 300);
+
+		for (int i = tpsBins.length-1; i >= 0 ; i -= 1) {
+			double angle = (tpsBins[i] - tpsMin) * (85 - 8.43) / (tpsMax - tpsMin);
+			fb.setThrottle(angle);
+			for (int j = 0; j < rpmBins.length; j++) {
+				fb.setRPM(rpmBins[j]);
+				fb.computeIntakeStroke(po);
+				int entry = (int) (fb.getAirAmount() * 300000.0 / tpsBins[i]);
+				System.out.printf("%3d\t", entry);
+			}
+			System.out.println();
+		}
+		System.out.println();
+	}
+	
+	private static void computeHP() {
+		double po = MSL_PRESSURE_PA;
+		FlowBenchIntegrator fb = new FlowBenchIntegrator(1.575, 0.19, 8.43, 9.5, 0.079, 0.0712, po, 300);
+		double bsfc = 273.0; // g/kWh
+		double afr = 14.7;
+
+		fb.setThrottle(75);
+		for (int rpm = 4000; rpm <= 9000; rpm += 500) {
+			fb.setRPM(rpm);
+			fb.computeIntakeStroke(po);
+			double mols = fb.getAirAmount();
+			double grams_hr = mols * 28.97 * rpm * 30 / afr;
+			double hp = grams_hr / (bsfc * 0.746);
+			System.out.printf("%d\t%f\t%f%n", rpm, mols, hp);
+		}
+	}
+
+	public static void main(String[] args) {
+//		computeHP();
+
+		double rpm = 1500;
+		double po = MSL_PRESSURE_PA;
+		FlowBenchIntegrator fb = new FlowBenchIntegrator(1.575, 0.19, 8.43, 9.5, 0.079, 0.0712, po, 300);
+		fb.setRPM(rpm);
+		System.out.printf("Throttle angle (deg)\tAir amount (mols)\tManifold pressure (Pa)\tCrank angle (deg)%n");
+		for (double angle = 0; angle <= 40; angle += 1) {
+			fb.setThrottle(angle);
+			fb.computeIntakeStroke(po);
+			System.out.printf("%04.1f\t%06.5f\t%10.4f\t%5.1f%n", angle, fb.getAirAmount(), fb.getMinPressure(), fb.getMinPressureAngle());
+		}
+		
+		double[] map = fb.getManifoldPressure();
+		System.out.printf("%nCrank angle (deg)\tMAP (Pa)%n");
+		for (double angle = 0; angle <= 180; angle += 10) {
+			int i = (int) ((map.length - 1) * angle / 180);
+			System.out.printf("%f\t%10.4f%n", angle, map[i]);
+		}
+	}
+}
